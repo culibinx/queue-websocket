@@ -1,0 +1,56 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<head>
+<meta charset="utf-8" />
+<script src="https://d3js.org/d3.v4.min.js"></script>
+<script src="./d3-websocket.v1.js"></script>
+<script type="text/javascript">
+    
+    'use strict';
+
+    var ws_echo_url = "ws://echo.websocket.org/"; 
+    var wss_echo_url = "wss://echo.websocket.org/"; 
+
+    var default_delay = 25;
+
+    function echo_simple(value, ssl, ws_url, ws_delay, wsock) { 
+        var _value = value ? value : document.getElementById('inp_op_send').value;
+        _value = _value.length ? _value : document.getElementById('inp_op_send').placeholder;
+        var url = ws_url?ws_url:+ssl?wss_echo_url:ws_echo_url;
+        var wsocket = wsock?wsock:new WebSocket(url);
+        var delay = ws_delay?parseInt(ws_delay):default_delay;
+        setTimeout(function () { 
+            console.log('send to: ' + url);
+            d3.queue(1)
+            .defer(d3.websocket, wsocket, [_value])
+            .await(function(error, resp) {
+                if (error) throw error;
+                console.log('response: ' + resp);
+                document.getElementById('inp_op_get').value = resp;
+                wsocket.close();
+            });
+        }, delay);
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      // echo
+      document.getElementById('btn_op_send').onclick = function() { echo_simple(undefined, 0); };
+      document.getElementById('btn_op_send_ssl').onclick = function() { echo_simple(undefined, 1); };
+    }); 
+
+</script>
+</head>
+<body>
+<table>
+    <tr>
+        <td>
+            <div id="main_redis">
+                <input type="text" size="20" placeholder="Vita sine libertate nihil!" id="inp_op_send" value=""/>
+                <input type="text" size="30" id="inp_op_get" value="" readonly="true" /> <br/>
+                <button id="btn_op_send" type="button">Send to echo server</button>
+                <button id="btn_op_send_ssl" type="button">Send to echo server(SSL)</button>
+            </div>
+        </td>
+    </tr>
+</table>
+</body>
+</html>

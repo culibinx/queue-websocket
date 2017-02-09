@@ -1,0 +1,89 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<head>
+<meta charset="utf-8" />
+<script src="https://d3js.org/d3.v4.min.js"></script>
+<script src="./d3-websocket.v1.js"></script>
+<script src="./d3-redis.v1.js"></script>
+<script type="text/javascript">
+    
+    'use strict';
+
+    // In this example, the connection to the redis through websocket
+    // Please read carefully before opening ports outside
+    // https://redis.io/topics/security
+    // You can also use a virtual private network or its encrypted tunnels
+
+    var ws_url_rb = "ws://centos/queue/redisb"; // blocking socket to redis
+    var ws_url_rn = "ws://centos/queue/redisn"; // non blocking socket to redis
+
+    var default_delay = 25;
+
+    function op_set (key, value, async, ttls, ttlms, flag_nx, flag_xx, ws_url, ws_delay, wsock) { 
+        //SET key value [EX seconds] [PX milliseconds] [NX|XX]
+        var _value = value !== undefined ? value : document.getElementById('inp_op_set').value;
+        _value = _value.length ? _value : document.getElementById('inp_op_set').placeholder;
+        var _ttls = parseInt(ttls?ttls:0);
+        var _ttlms = parseInt(ttlms?ttlms:0);
+        var _flag = flag_nx ? 'NX' : flag_xx ? 'XX' : '';
+        var url = ws_url?ws_url:+async?ws_url_rn:ws_url_rb;
+        var wsocket = wsock?wsock:new WebSocket(url);
+        var delay = ws_delay?parseInt(ws_delay):default_delay;
+        setTimeout(function () { 
+            console.log('op_set to: ' + url);
+            d3.queue(1)
+            .defer(d3.redis, wsocket, ['SET',
+                                          key,
+                                          _value,
+                                          _ttls?_ttls.toString():'',
+                                          _ttlms?_ttlms.toString():'',
+                                          _flag
+                                          ])
+            .await(function(error, set) {
+                if (error) throw error;
+                console.log(set);
+                wsocket.close();
+            });
+        }, delay);
+    }
+
+    function op_get (key, async, ws_url, ws_delay, wsock) { 
+        //GET key
+        var url = ws_url?ws_url:+async?ws_url_rn:ws_url_rb;
+        var wsocket = wsock?wsock:new WebSocket(url);
+        var delay = ws_delay?parseInt(ws_delay):default_delay;
+        setTimeout(function () { 
+            console.log('op_get from: ' + url);
+            d3.queue(1)
+            .defer(d3.redis, wsocket, ['GET',key])
+            .await(function(error, get) {
+                if (error) throw error;
+                console.log(get);
+                document.getElementById('inp_op_get').value = get.data.body;
+                wsocket.close();
+            });
+        }, delay);
+    }
+
+    document.addEventListener('DOMContentLoaded', function () {
+      // redis
+      document.getElementById('btn_op_set').onclick = function() { op_set('id1', undefined, 0); };
+      document.getElementById('btn_op_get').onclick = function() { op_get('id1', 1); };
+    }); 
+
+</script>
+</head>
+<body>
+<table>
+    <tr>
+        <td>
+            <div id="main_redis">
+                <input type="text" size="20" placeholder="value1" id="inp_op_set" value=""/> 
+                <button id="btn_op_set" type="button">Set operation to redis</button><br/>
+                <input type="text" size="20" id="inp_op_get" value="" readonly="true" /> 
+                <button id="btn_op_get" type="button">Get operation from redis</button><br/>
+            </div>
+        </td>
+    </tr>
+</table>
+</body>
+</html>

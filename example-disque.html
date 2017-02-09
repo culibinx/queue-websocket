@@ -1,0 +1,305 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<head>
+<meta charset="utf-8" />
+<script src="https://d3js.org/d3.v4.min.js"></script>
+<script src="./d3-websocket.v1.js"></script>
+<script src="./d3-redis.v1.js"></script>
+<script type="text/javascript">
+    
+    'use strict';
+
+    // In this example, the connection to the disque through websocket
+    // Please read carefully before opening ports outside
+    // https://redis.io/topics/security
+    // You can also use a virtual private network or its encrypted tunnels
+
+    var ws_url_b = "ws://centos/queue/queueb";
+    var ws_url_n = "ws://centos/queue/queuen";
+    var main_queue = "tasks";
+
+    var default_delay = 25;
+    var default_restart_delay = 10000;
+
+    var noreply_error = "ERRNOREPLY";
+    var socket_closed_error = "CLOSED";
+
+    var state_restart = 0;
+
+    // helper
+    function first_key(obj) { for (var firstKey in obj) return firstKey; }
+    function first_object(obj) { for (var firstKey in obj) return obj[firstKey]; }
+
+    function restart_job (ws_url, delay, wsock) {
+        //console.log('sleep ' + delay/1000 + ' sec');
+        var url = ws_url?ws_url:ws_url_b;
+        if (delay < 0 || state_restart < 0) {
+            console.log('cancel job');
+            if (wsock) { wsock.close(); }
+            state_restart = 0;
+        } else {
+            setTimeout(function () { 
+                if (!wsock || (wsock && wsock.readyState > 1)) {
+                    if (wsock) { wsock = null; }
+                    restart_job (url, delay, new WebSocket(url));
+                } else {
+                    __check_job (url, wsock);
+                }
+            }, delay);
+        }
+    }
+
+    function __check_job (ws_url, wsock) {
+        //console.log('run_job');
+        var url = ws_url?ws_url:ws_url_b;
+        var wsocket = wsock?wsock:new WebSocket(url);
+        d3.queue(1)
+        .defer(d3.redis, wsocket, 'PING')
+        .defer(d3.redis, wsocket, ['GETJOB','FROM',main_queue])
+        .await(function(error, ping, getjob) {
+            if (error == socket_closed_error) {
+                restart_job(url, default_restart_delay, wsocket);
+                return;
+            }
+            if (error) throw error;
+            var job_desc = getjob && getjob.data && getjob.data.elements ? first_object(getjob.data.elements) : null;
+            var current_job = job_desc && job_desc.length > 2 ? job_desc[1] : '';
+            if (!current_job || !current_job.length || getjob.data.body == noreply_error) {
+                //console.log('end_job:' + current_job ? current_job : getjob.data.error);
+                restart_job(url, default_delay, wsocket);
+            } else {
+                d3.queue(1)
+                .defer(d3.redis, wsocket, ['ACKJOB',current_job])
+                .defer(d3.redis, wsocket, ['QLEN',main_queue])
+                .await(function(error, ackjob, qlen) {
+                    if (error) throw error;
+                    //console.log(ackjob);
+                    console.log('[ack]', current_job);
+                    console.log(qlen.data.body !== undefined ? '[remained] ' + 
+                        (qlen.data.body.indexOf(noreply_error) == 0 ? 0 : qlen.data.body) : qlen);
+                    //console.log('end_job');
+                    restart_job(url, default_delay, wsocket);
+                });
+            }
+        });
+    }
+
+    function add_job_task (data, timeout, async, ws_url, ws_delay, wsock) { 
+        //ADDJOB queue_name job <ms-timeout> [REPLICATE <count>] [DELAY <sec>] [RETRY <sec>] [TTL <sec>] [MAXLEN <count>] [ASYNC]
+        var _timeout = parseInt(timeout?timeout:0);
+        var url = ws_url?ws_url:_timeout?ws_url_b:ws_url_n;
+        var wsocket = wsock?wsock:new WebSocket(url);
+        var delay = ws_delay?parseInt(ws_delay):default_delay;
+        setTimeout(function () { 
+            //console.log('run_add_job');
+            d3.queue(1)
+            .defer(d3.redis, wsocket, ['ADDJOB',main_queue,data,_timeout.toString(),+async?'ASYNC':''])
+            .await(function(error, add) {
+                if (error) throw error;
+                console.log(add);
+                //console.log('end_add_job');
+                if (!add.data.status || !add.data.body.length) {
+                    console.log('error for add job task:' + data);
+                    //console.log('end run_add_job');
+                    wsocket.close();
+                } else {
+                    d3.queue(1)
+                    .defer(d3.redis, wsocket, ['SHOW',add.data.body])
+                    .await(function(error, info) {
+                        if (error) throw error;
+                        console.log(info);
+                        wsocket.close();
+                        //console.log('end run_add_job');
+                    });
+                }
+            });
+        }, delay);
+    }
+
+    function get_job_task (timeout, ws_url, ws_delay, wsock) { 
+        // GETJOB [NOHANG] [TIMEOUT <ms-timeout>] [COUNT <count>] [WITHCOUNTERS] FROM queue1 queue2 ... queueN
+        var _timeout = parseInt(timeout?timeout:0);
+        var url = ws_url?ws_url:_timeout?ws_url_b:ws_url_n;
+        var wsocket = wsock?wsock:new WebSocket(url);
+        var delay = ws_delay?parseInt(ws_delay):default_delay;
+        setTimeout(function () { 
+            //console.log('get_job_sync');
+            d3.queue(1)
+            .defer(d3.redis, wsocket, ['GETJOB',_timeout?'TIMEOUT':'NOHANG',_timeout?_timeout.toString():'','FROM',main_queue])
+            .await(function(error, getjob) {
+                if (error) throw error;
+                console.log(getjob);
+                var job_desc = getjob && getjob.data && getjob.data.elements ? first_object(getjob.data.elements) : null;
+                var current_job = job_desc && job_desc.length > 2 ? job_desc[1] : '';
+                if (!current_job || !current_job.length || getjob.data.body == noreply_error) {
+                    console.log('not data get_job_sync');
+                    //console.log('end get_job_sync');
+                    wsocket.close();
+                } else {
+                    d3.queue(1)
+                    .defer(d3.redis, wsocket, ['ACKJOB',current_job])
+                    .defer(d3.redis, wsocket, ['QLEN',main_queue])
+                    .await(function(error, ackjob, qlen) {
+                        if (error) throw error;
+                        //console.log(ackjob);
+                        console.log('[ack]', current_job);
+                        console.log(qlen.data.body !== undefined ? '[remained] ' + 
+                            (qlen.data.body.indexOf(noreply_error) == 0 ? 0 : qlen.data.body) : qlen);
+                        wsocket.close();
+                        //console.log('end get_job_sync');
+                    });
+                }
+            });
+        }, delay);
+    }
+
+    function start_receive (btn_start,btn_stop) { 
+        if (!state_restart) {
+            document.getElementById(btn_start).disabled = true;
+            document.getElementById(btn_stop).disabled = false;
+            state_restart = 1;
+            restart_job();
+        }
+    }
+
+    function stop_receive (btn_start,btn_stop) { 
+        if (state_restart) {
+         state_restart = -1;
+         var previous = document.getElementById(btn_stop).innerHTML;
+         document.getElementById(btn_stop).disabled = true;
+         document.getElementById(btn_stop).innerHTML = 'Waiting...';
+         (function check_restart (i) {          
+             setTimeout(function () {   
+                if ((i-=1000) && state_restart < 0) {
+                  //console.log(i/1000 + ':sr' + state_restart);
+                  check_restart(i);
+                } else {
+                  if (state_restart < 0) {
+                    console.log('error cancel job');
+                    document.getElementById(btn_stop).disabled = false;
+                  } else {
+                    document.getElementById(btn_start).disabled = false;
+                  }
+                  document.getElementById(btn_stop).innerHTML = previous;
+                }
+             }, 1000)
+          })(default_restart_delay*5);
+        }
+    }
+
+    function scan_queues () { 
+        var wsocket = new WebSocket(ws_url_n);
+        //console.log('start scan_queues');
+        d3.queue(1)
+            .defer(d3.redis, wsocket, ['QSCAN','COUNT','1'])
+            .await(function(error, qscan) {
+                if (error) throw error;
+                //console.log(qscan);
+                var queues = qscan && qscan.data.elements ? first_object(qscan.data.elements) : null;
+                var first_queue = queues && queues.length ? queues[0] : '';
+                if (!first_queue.length) {
+                    console.log('no first queue');
+                    wsocket.close();
+                    //console.log('end scan_queues');
+                } else {
+                    d3.queue(1)
+                    .defer(d3.redis, wsocket, ['QSTAT',first_queue])
+                    .await(function(error, qstat) {
+                        if (error) throw error;
+                        console.log(qstat);
+                        wsocket.close();
+                        //console.log('end scan_queues');
+                    });
+                }
+            });
+    }
+
+    function scan_tasks_in_queue () { 
+        var wsocket = new WebSocket(ws_url_n);
+        //console.log('start scan_tasks');
+        d3.queue(1)
+            .defer(d3.redis, wsocket, ['JSCAN','QUEUE',main_queue])
+            .await(function(error, jscan) {
+                if (error) throw error;
+                console.log(jscan);
+                wsocket.close();
+                //console.log('end scan_tasks');
+            });
+    }
+
+    function info_first_task () { 
+        var wsocket = new WebSocket(ws_url_n);
+        //console.log('start info_first_task');
+        d3.queue(1)
+            .defer(d3.redis, wsocket, ['JSCAN','QUEUE',main_queue,'COUNT','1'])
+            .await(function(error, jscan) {
+                if (error) throw error;
+                //console.log(jscan);
+                var jobs = jscan && jscan.data.elements ? first_object(jscan.data.elements) : null;
+                var first_job = jobs && jobs.length ? jobs[0] : '';
+                if (!first_job.length) {
+                    console.log('no first job');
+                    wsocket.close();
+                    //console.log('end info_first_task');
+                } else {
+                    d3.queue(1)
+                    .defer(d3.redis, wsocket, ['SHOW',first_job])
+                    .await(function(error, show) {
+                        if (error) throw error;
+                        console.log(show);
+                        wsocket.close();
+                        //console.log('end info_first_task');
+                    });
+                }
+            });
+    }
+
+    function init() {
+        
+    }
+
+
+    document.addEventListener('DOMContentLoaded', function () {
+      // disque
+      document.getElementById('btn_get_job_task').onclick = function() { get_job_task(5000); };
+      document.getElementById('btn_add_job_task').onclick = function() { add_job_task('common task'); };
+      document.getElementById('btn_get_job_task_single').onclick = function() { get_job_task(); };
+      //
+      document.getElementById('btn_scan_queues').onclick = function() { scan_queues(); };
+      document.getElementById('btn_scan_tasks_in_queue').onclick = function() { scan_tasks_in_queue(); };
+      document.getElementById('btn_get_job_task_info').onclick = function() { info_first_task(); };
+      //
+      document.getElementById('start_r').onclick = function() { start_receive('start_r','stop_r'); };
+      document.getElementById('stop_r').onclick = function() { stop_receive('start_r','stop_r'); };
+      //
+      //init();
+    }); 
+
+</script>
+</head>
+<body>
+<table>
+    <tr>
+        <td>
+            <div id="main_cycle">
+                <button id="start_r" type="button">Start get task cycle</button><br/>
+                <button id="stop_r" type="button" disabled>Stop get task cycle</button><br/>
+                <button id="btn_get_job_task" type="button">Get task wait(5sec)</button><br/>
+            </div>
+        </td>
+        <td>
+            <div id="main_task">
+                <button id="btn_add_job_task" type="button">Append task</button><br/>
+                <button id="btn_get_job_task_single" type="button">Get task</button><br/>
+                <button id="btn_get_job_task_info" type="button">Scan and info first task</button><br/>
+            </div>
+        </td>
+        <td>
+            <div id="main_queue">
+                <button id="btn_scan_queues" type="button">Scan queues and stat first queue</button><br/>
+                <button id="btn_scan_tasks_in_queue" type="button">Scan tasks in queue</button><br/>
+            </div>
+        </td>
+    </tr>
+</table>
+</body>
+</html>
