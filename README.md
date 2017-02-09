@@ -90,7 +90,7 @@ var wsocket = new WebSocket(url);
 d3.queue(1) /* queue serial */
     .defer(d3.websocket, wsocket, 'ping to ws')
     .defer(d3.websocket, wsocket, 'what time is it')
-    .await(function(error, resp_one) {
+    .await(function(error, ping, resp_one) {
         if (error) throw error;
         if (resp_one == "two o'clock pm") {
             console.log("It's time to go");
@@ -135,7 +135,7 @@ d3.queue(1) /* queue serial */
 
 To get "url_to_websocket_redis" you can use such methods:
 
-1. [websockify](https://github.com/novnc/websockify)
+1. [Websockify](https://github.com/novnc/websockify)
 2. Apache HTTP Server + [mod_lua](https://httpd.apache.org/docs/2.4/mod/mod_lua.html) + Lua sockets
 3. Apache HTTP Server + mod_cgi + custom wrappers of any interpretators
 3. Nginx + custom wrappers of any interpretators
