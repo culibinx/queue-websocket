@@ -35,9 +35,9 @@ In the examples below, you can connect a full library d3.v4.min.js or only speci
 ```html
 <script src="https://d3js.org/d3.v4.min.js"></script>
 <script src="./d3-websocket.v1.js"></script>
+<script type="text/javascript">
 ```
-
-```javascript
+```js
 /* 
     If you send messages in the queue asynchronously, 
     use different websocket handlers 
@@ -58,7 +58,9 @@ d3.queue()  /* queue async */
         wsocket_ssl.close();
     });
 ```
-
+```html
+</script>
+```
 
 **Consistently send different requests to different resources**
 ```html
