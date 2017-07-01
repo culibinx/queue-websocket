@@ -17,6 +17,49 @@
 // Helpers functions
 if (!Array.prototype.isArray) Array.prototype.isArray = true;
 
+function quick_uuid() {
+    return 'm' + Math.random().toString(36).substring(2, 15) +
+    Math.random().toString(36).substring(2, 15);
+}
+
+function isObject(item) {
+  return item !== null && typeof item === "object" && !Array.isArray(item) && item === Object(item);
+}
+
+function itemToArray(item) {
+  var arr = [];
+  if (item && item != undefined && item !== null) {
+      if (isObject(item)) {
+          for (var key in item) {
+              if ( item.hasOwnProperty( key ) && typeof item[key] !== "function" ) {
+                  arr = arr.concat(itemToArray(key));
+                  arr = arr.concat(itemToArray(item[key]));
+              }
+          }
+      } else if (item.isArray) {
+          for (var i = 0; i < item.length; i++) {
+              arr = arr.concat(itemToArray(item[i]));
+          }
+      } else {
+          if (typeof item[key] !== "function" && item.length) 
+              { arr.push(item); }
+      }
+  }
+  return arr;
+}
+
+function arrayToItem(arr) {
+  var item = {};
+  if (arr && arr != undefined && arr !== null && arr.isArray) {
+    for (var i = 0; i < arr.length; i+=2) {
+      var key = arr[i];
+      var val = (i+1) < arr.length ? arr[i+1] : '';
+      item[key] = val;
+    }
+  }
+  return item;
+}
+
 function byte_count(s) {
     return encodeURI(s).split(/%..|./).length - 1;
 }
@@ -27,26 +70,15 @@ function byte_count(s) {
 function data_to_redis(data)
 {
   var msgs = '';
-  if (!data || data == undefined || !data.isArray) {
-    return '*1\r\n' + command_to_redis('PING');
-  } 
-  if (data.isArray) {
-    var filtered = data.filter(function(n){ return n != undefined && n.length });
-    if (!filtered.length)
-      return msgs;
-    for (var i = 0; i < filtered.length; i++) {
-        msgs += command_to_redis(filtered[i]);
-    }
-    return '*' + filtered.length + '\r\n' + msgs;
-  } 
-  return msgs;
+  var filtered = itemToArray(data);
+  if (!filtered.length) return msgs;
+  for (var i = 0; i < filtered.length; i++) {
+      msgs += command_to_redis(filtered[i]);
+  }
+  return '*' + filtered.length + '\r\n' + msgs;
 }
-
 function command_to_redis(command)
-{
-  return '$' + byte_count(command) + '\r\n' + command + '\r\n';
-}
-
+{ return '$' + byte_count(command) + '\r\n' + command + '\r\n'; }
 
 // parse response
 function parse_reply_result(result) {
@@ -231,11 +263,74 @@ function find_count_reply(reply, start, length, prefix) {
   return [value, ptr];
 }
 
+function parse_reply_custom(data_d) {
+  var result = {status:false};
+  if (!data_d.length) { return result; }
+  var data_arr = data_d.split('\r\n');
+  if (!data_arr.length) { result['error'] = data_d; return result; }
+  var data_f = data_arr.shift();
+  if (!data_arr.length) { result['error'] = data_d; return result; }
+  data_arr.pop();
+  var sub_f = data_f&&data_f.length?data_f.substr(0,1):'';
+  var data_c;
+  if (sub_f == '-') {
+      result['error'] = data_f.substr(1) + (data_arr.length?'\r\n'+data_arr.join('\r\n'):'');
+      result['status'] = false;
+      return result;
+  } else if (sub_f == ':') {
+      data_c = parseInt(data_f.substr(1));
+      result['body'] = ''+data_c;
+      result['status'] = true;
+      return result;
+  } else if (sub_f == '+') {
+      result['body'] = data_f.substr(1) + (data_arr.length?'\r\n'+data_arr.join('\r\n'):'');
+      result['status'] = true;
+      return result;
+  } else if (sub_f == '$') {
+      data_c = parseInt(data_f.substr(1));
+      result['len'] = ''+data_c;
+      result['status'] = true;
+      result['body'] = data_arr.join('\r\n');
+  } else if (sub_f == '*') {
+      data_c = parseInt(data_f.substr(1));
+      result['count'] = ''+data_c;
+      result['status'] = true;
+      result['elements'] = [];
+      if (data_c) {
+          data_f = data_arr.shift();
+          sub_f = data_f&&data_f.length?data_f.substr(0,1):'';
+          data_c = parseInt(sub_f == '$' || sub_f == '*' ? data_f.substr(1) : data_f);
+          if (data_c) {
+              data_d = data_arr.join('\r\n');
+              var re = /\r\n[\*|\$][0-9]{1,}\r\n/g;
+              data_arr = data_d.split(re);
+              if (data_arr.length && data_arr[0].length) { data_arr[0] = data_arr[0].replace(/^[\*|\$][0-9]{1,}\r\n/g,''); }
+              result['elements'] = data_arr;
+          } else {
+              result['body'] = data_f + (data_arr.length?'\r\n'+data_arr.join('\r\n'):'');
+          }
+      }
+  } else {
+      result['status'] = false;
+      result['error'] = 'unknown';
+      result['body'] = data_f + (data_arr.length?'\r\n'+data_arr.join('\r\n'):'');
+  }
+  return result;
+}
+
 var redissocket = function(url, data, callback) {
   return d3.websocket(url, data_to_redis(data), callback).response(parse_reply_result);
 }
 
+var redissocket_custom_parse_reply = function(url, data, callback) {
+  return d3.websocket(url, data_to_redis(data), callback).response(parse_reply_custom);
+}
+
+exports.quick_uuid = quick_uuid;
+exports.itemToArray = itemToArray;
+exports.arrayToItem = arrayToItem;
 exports.redis = redissocket;
+exports.redisx = redissocket_custom_parse_reply;
 
 Object.defineProperty(exports, '__esModule', { value: true });
 

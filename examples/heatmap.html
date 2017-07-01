@@ -1,0 +1,1087 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Карты активности</title>
+<script src="https://d3js.org/d3.v4.min.js"></script>
+<script src="../d3-websocket.v1.js"></script>
+<script src="../d3-redis.v1.js"></script>
+
+<script type="text/javascript">
+
+// Main script
+var mode_add_point = 0;
+var map, heatmap, geocoder, info;
+var key_point = {};
+var customTTL = 0;
+var current_key;
+
+var senderId = null;
+var sessionId = null;
+var displayName = null;
+
+var ws_url_rb = "wss://idev.su/queue/redisb"; // blocking socket to redis with timeout
+var ws_url_rn = "wss://idev.su/queue/redisn"; // non blocking socket to redis
+var ws_url_b = "wss://idev.su/queue/queueb";  // blocking socket to disque with timeout
+var ws_url_n = "wss://idev.su/queue/queuen";  // non blocking socket to disque
+var ws_url_bb = "wss://idev.su/queue/queuebb";  // blocking socket to listen disque
+
+var state_restart = 1;
+var default_delay = 25;
+var session_expire = 600*1000;
+var max_error_restart = 3;
+var marker_path = "markers"
+var point_path = "points"
+var session_path = "sessions"
+var user_path = "users"
+
+var queue_to_add = "markers_tasks_add";
+var queue_to_del = "markers_tasks_del";
+
+// Redis functions ----------------------------------------------------
+
+// Save our session
+// use session_expire seconds for expire and timer to prolongate
+function op_auth(callback) {
+    if (callback) {
+      var wsocket = new WebSocket(ws_url_rb);
+      var session_id = sessionId ? sessionId : d3.quick_uuid();
+      setTimeout(function () { 
+          d3.queue(1)
+          .defer(d3.redisx,wsocket,['INCR', session_path+'/'+session_id])
+          .defer(d3.redisx,wsocket,['EXPIRE', session_path+'/'+session_id, ''+session_expire])
+          .await(function(error, incr, exp) {
+              wsocket.close();
+              if (error) { callback({id:null,error:error}); } 
+              else {
+                callback({id:session_id,counter:incr.body});
+              }
+          });
+      }, default_delay);
+    }
+}
+
+// Update display nickname
+function op_update_profile(callback) {
+    if (senderId && sessionId && displayName && callback) {
+      var wsocket = new WebSocket(ws_url_rb);
+      setTimeout(function () { 
+          d3.queue(1).defer(d3.redisx, wsocket, 
+            ['HMSET',user_path+'/'+sessionId, 
+              {'sender':senderId,'name':displayName}])
+          .await(function(error, r) {
+              wsocket.close();
+              if (error) { callback({status:false,error:error}); } 
+              else {
+                callback({status:r.status});
+              }
+          });
+      }, default_delay);
+    }
+}
+
+// This for debug - option use on server only - LIST PREPARE ON SERVER
+// Select all markers
+function op_select_all_markers(callback) {
+    if (sessionId) {
+      var wsocket = new WebSocket(ws_url_rb);
+      setTimeout(function () { 
+          d3.queue(1).defer(d3.redisx, wsocket, 
+            ['KEYS',marker_path+'/*'])
+          .await(function(error, m) {
+              wsocket.close();
+              if (error) { if (callback) callback(null,{elements:[],error:error}); } 
+              else {
+                var arr = m.status?d3.itemToArray(m.elements):[];
+                for (var i = 0; i < arr.length; i++) {
+                  var key = arr[i].split('/')[1];
+                  op_get_marker(key, function(el) {
+                    if (callback) {
+                      callback(key,el);
+                    } else {
+                      showMarker(key,el);
+                    }
+                  });
+                }
+              }
+          });
+      }, default_delay);
+    }
+}
+
+// Get content of marker
+function op_get_marker(key, callback) {
+  if (key && callback) {
+    var wsocket = new WebSocket(ws_url_rb);
+    setTimeout(function () { 
+        d3.queue(1)
+        .defer(d3.redisx,wsocket,['HGETALL',marker_path+'/'+key])
+        .defer(d3.redisx,wsocket,['TIME'])
+        .await(function(error, el, time) {
+            wsocket.close();
+            if (error) { callback({status:false,error:error}); } 
+            else {
+              if (el.status && el.elements) {
+                var obj = d3.arrayToItem(el.elements);
+                var timestamp = time.status&&time.elements&&time.elements.length>1?
+                  parseInt(time.elements[0])*1000 + parseInt(time.elements[1])/1000 : 0;
+                if (timestamp) { obj['timediff'] = Math.round(new Date().getTime() - timestamp); }
+                callback(obj);
+              } else {
+                callback({status:false});
+              }
+            }
+        });
+    }, default_delay);
+  }
+}
+
+// Create and save new marker
+function op_create_marker(data,callback) {
+    if (sessionId && senderId && data && data.lng && data.lat && callback) {
+      var wsocket = new WebSocket(ws_url_rb);
+      setTimeout(function () { 
+          d3.queue(1).defer(d3.redisx, wsocket,'TIME')
+          .await(function(error, time) {
+              if (error) { callback({status:false,error:error}); wsocket.close(); } 
+              else {
+                var timestamp = time.status&&time.elements&&time.elements.length>1?
+                  parseInt(time.elements[0])*1000 + parseInt(time.elements[1])/1000 : 0;
+                if (!timestamp) { callback({status:false,error:error}); wsocket.close(); }
+                else {
+                  var diff = Math.round(new Date().getTime() - timestamp);
+                  var elements = time.status?time.elements:[];
+                  var key = d3.quick_uuid();
+                  var ttl = parseInt(data.ttl);
+                  ttl = ttl?ttl:1;
+                  data['ttl'] = '' + ttl;
+                  data['lng'] = '' + data.lng;
+                  data['lat'] = '' + data.lat;
+                  data['sender'] = senderId;
+                  data['session'] = sessionId;
+                  data['timestamp'] = '' + timestamp;
+                  d3.queue(1)
+                  .defer(d3.redisx, wsocket,['HMSET', marker_path+'/' + key, data])
+                  .defer(d3.redisx, wsocket,['GEOADD', point_path+'/' + key, data['lng'], data['lat'], senderId])
+                  .defer(d3.redisx, wsocket,['EXPIRE', marker_path+'/' + key, '' + (ttl*60)])
+                  .defer(d3.redisx, wsocket,['EXPIRE', point_path+'/' + key, '' + (ttl*60)])
+                  .await(function(error,op1,op2,op3,op4) {
+                    wsocket.close();
+                    if (error) { callback(null,null,{status:false,error:error}); } 
+                    else {
+                      if (op1.status && op2.status && op3.status && op4.status) {
+                        op_select_all_sessions(function(session) {
+                          if (session == sessionId) {
+                            // do not notify own session and simple add marker on map
+                            // console.log('do not notify on add');
+                          } else {
+                            // notify another sessions to add marker
+                            op_notify_to_add_marker(key,session,ttl*60, function(ret) {
+                              // console.log('notify on add', session, key, ret);
+                            });
+                          }
+                          // notify delete marker all sessions without check on server expire
+                          op_notify_to_delete_marker(key,session,ttl*60, function(ret) {
+                            // console.log('notify on delete', session, key, ret);
+                          });
+                        });
+                        // Success
+                        data['timediff'] = diff;
+                        callback(key, data);
+                      } else {
+                        // Error
+                        callback(null,null,{status:false,op1:op1,op2:op2,op3:op3,op3:op4});
+                      }
+                    } 
+                  });
+                }
+                
+              }
+          });
+      }, default_delay);
+    }
+}
+
+// This for debug - option may be blocked on server
+// Delete existing marker with expire timeout
+function op_delete_marker(key, callback) {
+  if (key) {
+      if (!callback) { removeMarker(key); };
+      var wsocket = new WebSocket(ws_url_rb);
+      setTimeout(function () { 
+          d3.queue(1)
+          .defer(d3.redisx, wsocket, ['EXPIRE', marker_path + '/' + key, '1'])
+          .defer(d3.redisx, wsocket, ['EXPIRE', point_path + '/' + key, '1'])
+          .await(function(error,el,elp) {
+              wsocket.close();
+              if (error) { if (callback) callback({status:false,error:error}); } 
+              else {
+                if (el.status && el.body == '1') {
+                  op_select_all_sessions(function(session) {
+                      if (session == sessionId) {
+                        // do not notify own session and simple delete marker
+                        // console.log('do not notify own on delete');
+                      } else {
+                        // notify immediatelly other sessions to remove marker
+                        op_notify_to_delete_marker(key,session,0, function(ret) {
+                          // console.log('notify another to delete', session, key, ret);
+                        });
+                      }
+                    });
+                  if (callback) callback({status:true});
+                } else {
+                  if (callback) callback({status:false});
+                }
+              }
+          });
+      }, default_delay);
+   }
+}
+
+// This for debug - option use on server only - ROUTE on sessions
+// List open sessions
+function op_select_all_sessions(callback) {
+    if (sessionId && callback) {
+      var wsocket = new WebSocket(ws_url_rb);
+      setTimeout(function () { 
+          d3.queue(1).defer(d3.redisx, wsocket, ['KEYS', session_path+'/*'])
+          .await(function(error, m) {
+              wsocket.close();
+              if (error) { callback(null,{elements:[],error:error}); } 
+              else {
+                var arr = m.status?d3.itemToArray(m.elements):[];
+                for (var i = 0; i < arr.length; i++) {
+                  var session = arr[i].split('/')[1];
+                  callback(session);
+                }
+              }
+          });
+      }, default_delay);
+    }
+}
+
+// Disque functions ----------------------------------------------------
+
+// This for debug - option use on server only
+// Notify all open sesions with event to add marker
+function op_notify_to_add_marker(key,session,ttl,callback) {
+  if (key && session) {
+    var wsocket = new WebSocket(ws_url_b);
+    setTimeout(function () { 
+        d3.queue(1)
+        .defer(d3.redisx, wsocket, 
+          ['ADDJOB',queue_to_add+'/'+session,key,'0', ttl?['TTL',''+ttl]:'', 'ASYNC'])
+        .await(function(error, el) {
+            wsocket.close();
+            if (error) { if (callback) callback({status:false,error:error}); } 
+            else {
+              if (el.status && el.body) {
+                if (callback) callback({jobid:el.body});
+              } else {
+                if (callback) callback({status:false});
+              }
+            }
+        });
+    }, default_delay);
+  }
+}
+
+// This for debug - option use on server only
+// Notify all open sesions with event to delete marker
+function op_notify_to_delete_marker(key,session,delay,callback) {
+  if (key && session) {
+    var wsocket = new WebSocket(ws_url_b);
+    setTimeout(function () { 
+        d3.queue(1)
+        .defer(d3.redisx, wsocket, 
+          ['ADDJOB',queue_to_del+'/'+session,key,'0', delay?['DELAY',''+delay]:'', 'ASYNC'])
+        .await(function(error, el) {
+            wsocket.close();
+            if (error) { if (callback) callback({status:false,error:error}); } 
+            else {
+              if (el.status && el.body) {
+                if (callback) callback({jobid:el.body});
+              } else {
+                if (callback) callback({status:false});
+              }
+            }
+        });
+    }, default_delay);
+  }
+}
+
+// Listen our session incoming jobid for event on add marker
+function op_listen_to_queue_on_add_marker(callback) {
+    if (sessionId) {
+      var wsocket = new WebSocket(ws_url_bb);
+      setTimeout(function () { 
+          d3.queue(1)
+          .defer(d3.redisx, wsocket, 
+            ['GETJOB',/*'NOHANG',*/'COUNT','1','FROM',queue_to_add+'/'+sessionId])
+          .await(function(error, el) {
+              wsocket.close();
+              if (error) { state_restart--; // console.log('jobs to add error', error);
+                if (callback) callback({status:false,error:error}); } 
+              else {
+                if (el.status && el.elements && el.elements.length > 2) {
+                  var job = el.elements;
+                  var jobjd = job[1];
+                  var key = job[2];
+                  //console.log('on_add_marker',job);
+                  if (key && key.length) {
+                    if (callback) { callback({key:key,status:true,job:job}) }
+                    else {
+                      // check for non existing marker
+                      if (!key_point[key]) {
+                        // check for existing marker on server
+                        op_get_marker(key, function(el) {
+                          if (el && el.lat && el.lng) {
+                            // console.log('show marker', key);
+                            showMarker(key,el);
+                          } else {
+                            // console.log('marker not exists on server', key);
+                          }
+                        });
+                        op_fastack_job(jobjd);
+                      } else {
+                        // remove aready known job
+                        // console.log('remove aready known job ' + key, jobjd);
+                        op_del_job(jobjd);
+                      }
+                    }
+                  } else {
+                    // remove empty job
+                    // console.log('error remove empty job', jobjd);
+                    op_del_job(jobjd);
+                    if (callback) callback({status:false,job:job});
+                  }
+                } else {
+                  //console.log('jobs to add', parseInt(el.count));
+                  if (callback) callback({status:false});
+                }
+              }
+              if (state_restart) {  
+                op_listen_to_queue_on_add_marker(callback);
+              }
+          });
+      }, default_delay);
+    }
+}
+
+// Listen our session incoming jobid for event on del marker
+function op_listen_to_queue_on_del_marker(callback) {
+  if (sessionId) {
+    var wsocket = new WebSocket(ws_url_bb);
+    setTimeout(function () { 
+        d3.queue(1)
+        .defer(d3.redisx, wsocket, 
+          ['GETJOB',/*'NOHANG'*/,'COUNT','1','FROM',queue_to_del+'/'+sessionId])
+        .await(function(error, el) {
+            wsocket.close();
+            if (error) { state_restart--; // console.log('jobs to del error', error);
+              if (callback) callback({status:false,error:error}); } 
+            else {
+              if (el.status && el.elements && el.elements.length > 2) {
+                var job = el.elements;
+                var jobjd = job[1];
+                var key = job[2];
+                // console.log('on_del_marker',job);
+                if (key && key.length) {
+                  if (callback) { callback({key:key,status:true,job:job});  }
+                  else {
+                    // check for existing marker
+                    if (key_point[key]) {
+                      // console.log('ignore status and remove marker', key);
+                      op_delete_marker(key);
+                      op_fastack_job(jobjd);
+                    } else {
+                      // remove unused job
+                      // console.log('remove unused job to del ' + key, jobjd);
+                      op_del_job(jobjd);
+                    }
+                  }
+                } else {
+                  // remove empty job
+                  // console.log('error remove empty job', jobjd);
+                  op_del_job(jobjd);
+                  if (callback) callback({status:false,job:job});
+                }
+              } else {
+                // console.log('jobs to del', parseInt(el.count));
+                if (callback) callback({status:false});
+              }
+            }
+            if (state_restart) {  
+              op_listen_to_queue_on_del_marker(callback);
+            }
+        });
+    }, default_delay);
+  }
+}
+
+// Ack job
+function op_fastack_job(jobjd,callback) {
+  if (jobjd) {
+    var wsocket = new WebSocket(ws_url_b);
+    setTimeout(function () { 
+        d3.queue(1)
+        .defer(d3.redisx, wsocket, 
+          ['FASTACK',jobjd])
+        .await(function(error, el) {
+            wsocket.close();
+            if (error) { if (callback) callback({status:false,error:error}); } 
+            else {
+              if (callback) callback(el);
+            }
+        });
+    }, default_delay);
+  }
+}
+
+// Delete job
+function op_del_job(jobjd,callback) {
+  if (jobjd) {
+    var wsocket = new WebSocket(ws_url_b);
+    setTimeout(function () { 
+        d3.queue(1)
+        .defer(d3.redisx, wsocket, 
+          ['DELJOB',jobjd])
+        .await(function(error, el) {
+            wsocket.close();
+            if (error) { if (callback) callback({status:false,error:error}); } 
+            else {
+              if (callback) callback(el);
+            }
+        });
+    }, default_delay);
+  }
+}
+
+// ----------------  Map functions ------------------------------- //
+
+// Init map on load
+function initMap() {
+  
+  geocoder = new google.maps.Geocoder();
+  map = new google.maps.Map(document.getElementById('map'), {
+    mapTypeControl: true,
+    mapTypeControlOptions: {
+        style: google.maps.MapTypeControlStyle.HORIZONTAL_BAR,
+        mapTypeIds: ['roadmap', 'satellite', 'hybrid', 'terrain'],
+        position: google.maps.ControlPosition.LEFT_BOTTOM
+    },
+    gestureHandling: 'greedy',
+    center: {lat: 55.755826, lng: 37.6173},
+    zoom: 3,
+    disableDoubleClickZoom: true,
+    disableDefaultUI: true
+  });
+
+  info = new google.maps.InfoWindow({map: map});
+  info.close();
+
+  var doubleClickTime = 0;
+  var threshold = 200;
+  
+  map.addListener('click', function(e) {
+    //toggleBounce();
+    if (e.placeId) {
+        // console.log('You clicked on place:' + e.placeId);
+    } else {
+      var t0 = new Date();
+         if (t0 - doubleClickTime > threshold) {
+          setTimeout(function () {
+              if (t0 - doubleClickTime > threshold) {
+                  findClosestPoint(e);
+              }
+          },threshold);
+       }
+    }
+  });
+
+  map.addListener('dblclick', function(e) {
+    doubleClickTime = new Date();
+    if (mode_add_point) {
+      var state = document.getElementById('state').value;
+      var m_point = {
+        lat:e.latLng.lat(),
+        lng:e.latLng.lng(),
+        ttl:selectedTTL(),
+        state:state&&state.length?state:'+'
+      }
+      op_create_marker(m_point, function(key, el, error) {
+        if (key) {
+          // On success simple add our marker
+          showMarker(key, el);
+        } else {
+          // On error
+          // console.log('error create marker', error);
+        }
+      });
+    } else {
+      map.setZoom(map.zoom+1);
+    }
+  });
+
+  document.getElementById("address")
+    .addEventListener("keyup", function(event) {
+    event.preventDefault();
+    if (event.keyCode == 13) {
+        document.getElementById("find_address").click();
+    }
+  });
+
+  heatmap = new google.maps.visualization.HeatmapLayer({
+    data: [],
+    map: map,
+    radius: 16,//radius: 16,
+    dissipating: true,
+    gradient : [
+          'rgba(0, 255, 255, 0)',
+          'rgba(255, 255, 191, 0.5)',//'rgba(0, 255, 255, 1)',
+          'rgba(255, 191, 127, 0.5)',//'rgba(0, 191, 255, 1)',
+          'rgba(0, 127, 255, 0.5)',//'rgba(0, 127, 255, 1)',
+          'rgba(0, 63, 255, 0.5)',//'rgba(0, 63, 255, 1)',
+          'rgba(0, 0, 255, 1)',//'rgba(0, 0, 255, 1)',
+          'rgba(0, 0, 223, 1)',//'rgba(0, 0, 223, 1)',
+          'rgba(0, 0, 191, 1)',
+          'rgba(0, 0, 159, 1)',
+          'rgba(0, 0, 127, 1)',
+          'rgba(63, 0, 91, 0.5)',//'rgba(63, 0, 91, 1)',
+          'rgba(127, 0, 63, 0.5)',//'rgba(127, 0, 63, 1)',
+          'rgba(191, 0, 31, 0.5)',//'rgba(191, 0, 31, 1)',
+          'rgba(255, 0, 0, 0.5)'//'rgba(255, 0, 0, 1)'
+        ],
+    opacity: .1
+  });
+  heatmap.setMap(map);
+  
+  centerLocation();
+  initAuthentication(initMarkerData.bind(undefined, heatmap));
+}
+
+// Anonimous authentification + timer on update session presence
+function initAuthentication(onSuccess) {
+  //if (sessionId) { return; }
+  op_auth(function(sess) {
+    if (sess.id && sess.counter) {
+      console.log('Auth['+sess.counter+']:',sess.id);
+      sessionId = sess.id;
+      senderId = senderId ? senderId : d3.quick_uuid();
+      displayName = displayName ? displayName : "Anonymous" + senderId.substr(10, 8);
+      op_update_profile(function(op) {
+        if (op.status) { 
+          // max attempts error connections on restart queue
+          state_restart = max_error_restart;
+          // Success
+          // Update session presence bit
+          setTimeout(function () { 
+              initAuthentication(function() {
+               // console.log('update session successfully');
+              });
+           }, session_expire-10);
+          if (onSuccess) { onSuccess(); }
+        } else {
+          // console.log('Update profile failed', op.error);
+        }
+      });
+    } else {
+      sessionId = null;
+      senderId = null;
+      displayName = null;
+      state_restart = 0;
+      console.log('Login Failed!',sess.error);
+    }
+  });
+}
+
+// Get all markers from server
+function initMarkerData(heatmap) {
+  if (heatmap) {
+    op_select_all_markers();
+    op_listen_to_queue_on_add_marker();
+    op_listen_to_queue_on_del_marker();
+  }
+}
+
+// Button current location on gps data
+function centerLocation() {
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(function(position) {
+      var pos = {
+        lat: position.coords.latitude,
+        lng: position.coords.longitude
+      };
+      map.setCenter(pos);
+      map.setZoom(14);
+      info.close();
+      info = new google.maps.InfoWindow({map: map});
+      info.setPosition(pos);
+      info.setContent('Вы здесь &radic;');
+      window.setTimeout(function() {
+        info.close();
+      }, 5*1000);
+    }, function() {
+      document.getElementById('center_btn').enabled = false;
+    });
+  } else {
+    document.getElementById('center_btn').enabled = false;
+  }
+}
+
+// Show marker on map
+function showMarker(key, el) {
+  // check exists
+  if (key && !key_point[key] && el && el.lat && el.lng) {
+    var point = new google.maps.LatLng(el.lat, el.lng);
+    // add marker on map
+    heatmap.getData().push(point);
+    // save cache markers
+    el['point'] = point.toString();
+    var marker = new google.maps.Marker({
+      position: point,
+      title: el.state,
+      icon: getCircle(3.5),
+      map: map,
+      snippet: key
+    });
+    //marker.addListener('click', toggleBounce);
+    el['marker'] = marker;
+    key_point[key] = el;
+  }
+}
+
+// Remove maker from map
+function removeMarker(key) {
+  // check exists
+  // console.log('try remove Marker', key);
+  var position = findMarkerPositionByKey(key);
+  if (position >= 0) {
+    if (key == current_key) { current_key = null; info.close(); }
+    var heatmapData = heatmap.getData();
+    heatmapData.removeAt(i);
+    var marker = key_point[key]['marker'];
+    if (marker) {
+      marker.setMap(null);
+      marker = null;
+    }
+    delete key_point[key];
+  }
+}
+
+// ----------------  Chat functions ------------------------------------ //
+
+// ----------------  Helper functions ------------------------------------ //
+
+// Show alert with LatLng position on key
+function showPositionByKey(key) {
+  var position = findMarkerPositionByKey(key);
+  var heatmapData = heatmap.getData();
+  if (position < heatmapData.length) {
+    var point = new google.maps
+      .LatLng(heatmapData.getAt(position).lat(), heatmapData.getAt(position).lng());
+    var point_position = point.toString();
+    alert('Position:' + point_position);
+    //console.log('position', point_position);
+  }
+}
+
+// Find current platform for switch beetwen double click events
+function getPlatform() {
+  var userAgent = navigator.userAgent || navigator.vendor || window.opera;
+  // Windows Phone must come first because its UA also contains "Android"
+  if (/windows phone/i.test(userAgent)) {
+      return "Windows Phone";
+  }
+  if (/android/i.test(userAgent)) {
+      return "Android";
+  }
+  // iOS detection from: http://stackoverflow.com/a/9039885/177710
+  if (/iPad|iPhone|iPod/.test(userAgent) && !window.MSStream) {
+      return "iOS";
+  }
+  return userAgent;
+}
+
+// Find marker on key
+function findMarkerPositionByKey(key) {
+  var heatmapData = heatmap.getData();
+  if (key && key_point[key]) {
+    var point_source = key_point[key].point;
+    for (i = 0; i < heatmapData.length; i++) {
+        var point = new google.maps.LatLng(heatmapData.getAt(i).lat(), heatmapData.getAt(i).lng());;
+        var point_check = point.toString();
+        if (point_source == point_check) {
+          return i;
+        }
+      }
+  }
+  return -1;
+}
+
+// Find marker by position on heatmap
+function findMarkerKeyByPosition(position) {
+  var heatmapData = heatmap.getData();
+  if (position < heatmapData.length) {
+    var point = new google.maps
+      .LatLng(heatmapData.getAt(position).lat(), heatmapData.getAt(position).lng());
+    var point_check = point.toString();
+    for (var key in key_point) {
+      var point_source = key_point[key].point;
+      if (point_source == point_check) {
+            return key;
+         }
+    }
+  }
+  return null;
+}
+
+// Find nearest marker on map and fire InfoWindow
+function findClosestPoint(event) {
+  var distances = [];
+  var closest = -1;
+  var heatmapData = heatmap.getData();
+  for (i = 0; i < heatmapData.length; i++) {
+      var point = pointFromIndex(i);
+      var d = google.maps.geometry.spherical.computeDistanceBetween(point, event.latLng);
+      distances[i] = d;
+      if (closest == -1 || d < distances[closest]) {
+          closest = i;
+      }
+  }
+  if (closest > -1) {
+    infoFromPosition(closest);
+  }
+  //console.log('point: ' + closest);
+}
+
+// Change zoom map
+function changeZoom(opt) {
+  if (opt == '+') {
+      map.setZoom(map.zoom+1);
+  } else {
+    if (map.zoom-1 >= 0) {
+      map.setZoom(map.zoom-1);
+    }
+  }
+}
+
+// Find location on entered address
+function codeAddress() {
+  var address = document.getElementById('address').value;
+  if (!address.length) {
+    return;
+  }
+  geocoder.geocode( { 'address': address}, function(results, status) {
+    if (status == 'OK') {
+      var pos = results[0].geometry.location;
+      map.setCenter(pos);
+      map.setZoom(14);
+      info.close();
+      info = new google.maps.InfoWindow({map: map});
+      info.setPosition(pos);
+      info.setContent('This &radic;');
+    } else {
+      // console.log('Geocode was not successful for the following reason: ' + status);
+    }
+  });
+}
+
+// Get LatLng from markers with index
+function pointFromIndex(i) {
+  var heatmapData = heatmap.getData();
+  if (i < heatmapData.length) {
+    return new google.maps.LatLng(heatmapData.getAt(i).lat(), heatmapData.getAt(i).lng());
+  } 
+  return null;
+}
+
+// Adopt content and display info for marker
+function infoFromPosition(position) {
+  var key = findMarkerKeyByPosition(position);
+  var obj = key ? key_point[key] : null;
+  if (!obj) { return; }
+  // console.log(obj);
+  info.close();
+  current_key = key;
+
+  var elapsed = new Date().getTime() - parseInt(obj.timestamp);
+  
+  // Align to server time
+  if (obj.timediff) { elapsed-= obj.timediff; }
+  
+  var ttl = parseInt(obj.ttl);
+  var sec_num = Math.max(60 * (ttl ? ttl : 1) * 1000 - elapsed, 0);
+  sec_num = Math.round(sec_num/1000);
+  
+  var content = '<div>' + obj.state + '<hr>';
+  if (sec_num) {
+    var hours   = Math.floor(sec_num / 3600);
+    var minutes = Math.floor((sec_num - (hours * 3600)) / 60);
+    var seconds = sec_num - (hours * 3600) - (minutes * 60);
+    if (hours   < 10) {hours   = "0"+hours;}
+    if (minutes < 10) {minutes = "0"+minutes;}
+    if (seconds < 10) {seconds = "0"+seconds;}
+    content += 
+    "<button onclick=\"showPositionByKey('" + key + "')\">" +
+    '<small>[ ' + hours + ':' + minutes + ':' + seconds + ' ]</small>' + 
+    "</button> ";
+  }
+  
+  if (obj.sender == senderId || obj.session == sessionId) {
+    content += "<button onclick=\"op_delete_marker('" + key + "')\">Удалить</button>";
+  }
+  content += '</div>';
+  
+  info = new google.maps.InfoWindow({map: map});
+  info.setPosition(new google.maps.LatLng(obj.lat, obj.lng));
+  
+  info.setContent(content);
+  //toggleBounce();
+}
+
+// Show dialog for custom TTL in minutes for marker
+function customOptionSelect() {
+  var el = document.getElementById("ttl_select");
+  if(el.selectedIndex==0) {
+    var result = prompt('Enter number minutes', '0');
+    var minutes = parseInt(result);
+    if (minutes > 0) {
+      for (i = el.length - 1; i >= 7; i--) {
+        el.remove(i);
+      }
+      customTTL = minutes;
+      var opt = document.createElement('option');
+      opt.value = customTTL;
+      opt.innerHTML = customTTL + ' мин';
+      el.appendChild(opt);
+      el.selectedIndex = el.length-1;
+    } else {
+      el.selectedIndex = 1;
+    }
+  }
+}
+
+// Get selected TTL in minutes
+function selectedTTL() {
+  var el = document.getElementById("ttl_select");
+  var value = el.options[el.selectedIndex].value;
+  if(value=='0') {
+    value = customTTL > 0 ? customTTL : 1;
+  }
+  return value;
+}
+
+// Toggle controls in visible/invisible states
+function toggleHeatmap() {
+  
+  mode_add_point = !mode_add_point;
+
+  var el_mod_map = document.getElementById("mode_map");
+  var el_mod_location = document.getElementById("mode_location");
+  var el_div_state_select = document.getElementById("div_state_select");
+  var el_div_state_ttl = document.getElementById("div_state_ttl");
+  var el_div_address_select = document.getElementById("div_address_select");
+  var el_div_address_find = document.getElementById("div_address_find");
+  if (!mode_add_point) {
+    info.close();
+    el_mod_map.style.display = 'block';
+    el_mod_location.style.display = 'none';
+    el_div_state_select.style.display = 'none';
+    el_div_state_ttl.style.display = 'none';
+    el_div_address_select.style.display = 'block';
+    el_div_address_find.style.display = 'block';
+  } else {
+    el_mod_map.style.display = 'none';
+    el_mod_location.style.display = 'block';
+    el_div_state_select.style.display = 'block';
+    el_div_state_ttl.style.display = 'block';
+    el_div_address_select.style.display = 'none';
+    el_div_address_find.style.display = 'none';
+  }
+}
+
+// Map style marker
+function getCircle(radius) {
+  return {
+    path: google.maps.SymbolPath.CIRCLE,
+    fillColor: 'green',//fillColor: 'red',
+    fillOpacity: .7,//fillOpacity: .2,
+    scale: Math.pow(2, radius) / 2,
+    strokeColor: 'white',
+    strokeWeight: 1.2
+  };
+}
+
+// Map animation marker
+function toggleBounce() {
+  var marker = current_key&&key_point[current_key]?
+                  key_point[current_key]['marker']:
+                    this&&this.snippet&&key_point[this.snippet]?
+                      key_point[this.snippet]['marker']:
+                        null;
+  if (marker) {
+    if (info.getMap() || marker.getAnimation() !== null) {
+      marker.setAnimation(null);
+    } else {
+      marker.setAnimation(google.maps.Animation.BOUNCE);
+    }
+  }
+}
+
+</script>
+
+<style type="text/css">
+  #map {
+    height: 100%;
+  }
+  html, body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+  #panel_top_left {
+    position: absolute;
+    left: 10px;
+    top: 5px;
+    z-index: 3;
+  }
+  #panel_center_left {
+    position: absolute;
+    left: 10px;
+    /*right: 10px;*/
+    top: -40px;
+    z-index: 10;
+  }
+  #panel_top_right {
+    position: absolute;
+    right: 10px;
+    top: 5px;
+    z-index: 5;
+  }
+  #panel_center_right {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    -webkit-transform: translate(0%, -50%);
+    transform: translate(0%, -50%);
+    z-index: 7;
+  }
+  .rounded {
+    border-radius: 50%;
+    color:black;
+    background-color: white;
+    width: 50px;
+    height: 50px;
+    text-align:center;
+  }
+  .rounded_small {
+    border-radius: 50%;
+    color:black;
+    background-color: white;
+    width: 20px;
+    height: 20px;
+    text-align:center;
+  }
+  .rounded_10 {
+    border-radius: 10%;
+    color:black;
+    background-color: white;
+  }
+  .mainselection select {
+     border: 0;
+     font-size: 12px;
+     font-weight: bold;
+     padding: 2px 10px;
+     width: 65px;
+     height: 30px;
+     *width: 65px;
+     *background: #58B14C;
+     -webkit-appearance: none;
+  }
+  .maininput input {
+     border: 0;
+     font-size: 12px;
+     font-weight: bold;
+     padding: 10px 2px;
+     width: 160px;
+     height: 10px;
+     *width: 160px;
+     *background: #58B14C;
+     -webkit-appearance: none;
+  }
+</style>
+
+</head>
+<body>
+<div id="panel_top_left">
+  <table><tr>
+    <td>
+    <div>
+    <button class="rounded" id="toggle_btn_eye" onclick="toggleHeatmap()">
+    <div id="mode_map">
+    <img src="data:image/svg+xml;utf8;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pgo8IS0tIEdlbmVyYXRvcjogQWRvYmUgSWxsdXN0cmF0b3IgMTkuMC4wLCBTVkcgRXhwb3J0IFBsdWctSW4gLiBTVkcgVmVyc2lvbjogNi4wMCBCdWlsZCAwKSAgLS0+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmVyc2lvbj0iMS4xIiBpZD0iQ2FwYV8xIiB4PSIwcHgiIHk9IjBweCIgdmlld0JveD0iMCAwIDYwIDYwIiBzdHlsZT0iZW5hYmxlLWJhY2tncm91bmQ6bmV3IDAgMCA2MCA2MDsiIHhtbDpzcGFjZT0icHJlc2VydmUiIHdpZHRoPSIzMnB4IiBoZWlnaHQ9IjMycHgiPgo8Zz4KCTxwYXRoIGQ9Ik01Mi45OTQsMjFjMC03LjE2OS0zLjYxNy0xMy41MDUtOS4xMTYtMTcuMjk2bC0wLjAwMi0wLjAxNWwtMC4xNDUtMC4wOTVjLTAuMDA0LTAuMDAyLTAuMDA3LTAuMDA1LTAuMDExLTAuMDA3ICAgbC0wLjIyOC0wLjE1Yy0wLjQ1Mi0wLjI5Ni0wLjkxNS0wLjU3Mi0xLjM4NS0wLjgzMWMtMC4xNjUtMC4wOTEtMC4zMzctMC4xNzEtMC41MDUtMC4yNThDNDEuMjI4LDIuMTU1LDQwLjg1LDEuOTcsNDAuNDY2LDEuOCAgIGMtMC4yMTEtMC4wOTQtMC40MjQtMC4xODMtMC42MzktMC4yN2MtMC4zOTUtMC4xNi0wLjc5Ni0wLjMwNS0xLjE5OS0wLjQ0Yy0wLjE3OC0wLjA1OS0wLjM1Mi0wLjEyNS0wLjUzMS0wLjE4ICAgYy0wLjU2OC0wLjE3My0xLjE0NC0wLjMyMS0xLjcyNi0wLjQ0NWMtMC4xNy0wLjAzNi0wLjM0My0wLjA2Mi0wLjUxNC0wLjA5NGMtMC40NjItMC4wODYtMC45MjctMC4xNTgtMS4zOTYtMC4yMTMgICBjLTAuMTg4LTAuMDIyLTAuMzc1LTAuMDQ1LTAuNTY0LTAuMDYyQzMzLjI2NiwwLjAzOSwzMi42MzIsMCwzMS45OTQsMGMtMC42NDcsMC0xLjI4OSwwLjA0LTEuOTI3LDAuMDk4ICAgYy0wLjE4MSwwLjAxNy0wLjM1OSwwLjAzOS0wLjUzOSwwLjA2QzI5LjA0LDAuMjE1LDI4LjU1NiwwLjI5LDI4LjA3NiwwLjM4Yy0wLjE1NSwwLjAyOS0wLjMxMSwwLjA1NC0wLjQ2NCwwLjA4NyAgIGMtMS4yNDUsMC4yNjUtMi40NiwwLjY0NC0zLjYzNSwxLjEzMWMtMC4xMjIsMC4wNTEtMC4yNDEsMC4xMDQtMC4zNjIsMC4xNTdjLTAuNDg0LDAuMjExLTAuOTYsMC40NDEtMS40MjgsMC42ODkgICBjLTAuMSwwLjA1My0wLjIwMSwwLjEwNC0wLjMwMSwwLjE1OGMtMC41NzMsMC4zMTYtMS4xMzcsMC42NDktMS42ODMsMS4wMmwtMC40MywwLjI5M2wtMC4wMDEsMC4wNDEgICBjLTAuNjU3LDAuNDczLTEuMjgyLDAuOTg0LTEuODgsMS41MjdsLTIuODY5LTIuODY5bC0wLjcwNywwLjcwN0M5LjYwMyw4LjAzNyw3LjAwNiwxNC4zMTQsNy4wMDYsMjFzMi41OTcsMTIuOTYzLDcuMzEyLDE3LjY3OCAgIGM0LjQ4MSw0LjQ4MSwxMC4zNzUsNy4wNDQsMTYuNjg4LDcuMjg4VjU1aC0xMHY1aDIydi01aC0xMHYtOS4wMzVjNi4zMDQtMC4yNDksMTIuMTktMi44MTEsMTYuNjY2LTcuMjg3bDAuNzA3LTAuNzA3bC0yLjg2OS0yLjg2OSAgIEM1MC45MDUsMzEuMzcsNTIuOTk0LDI2LjQzLDUyLjk5NCwyMXogTTIxLjc1Miw1LjAyMmMwLjg2OS0wLjU1OSwxLjc4MS0xLjA1OCwyLjczOS0xLjQ3MWMwLjA5NC0wLjA0MSwwLjE5LTAuMDc5LDAuMjg0LTAuMTE4ICAgYzAuNDU4LTAuMTg5LDAuOTI0LTAuMzYsMS4zOTktMC41MTNjMC4wODctMC4wMjgsMC4xNzItMC4wNiwwLjI1OS0wLjA4NmMwLjU0Ni0wLjE2NywxLjEwMy0wLjMxMiwxLjY2OS0wLjQzICAgYzAuMDg5LTAuMDE5LDAuMTc5LTAuMDMxLDAuMjY5LTAuMDQ4YzAuNDcyLTAuMDkyLDAuOTUtMC4xNjQsMS40MzMtMC4yMTljMC4xNTItMC4wMTgsMC4zMDQtMC4wMzUsMC40NTctMC4wNDkgICBDMzAuODMyLDIuMDM2LDMxLjQwOSwyLDMxLjk5NCwyYzAuNTc4LDAsMS4xNDgsMC4wMzYsMS43MTMsMC4wODdjMC4xNDQsMC4wMTMsMC4yODgsMC4wMjYsMC40MzIsMC4wNDMgICBjMC41NDYsMC4wNjIsMS4wODcsMC4xNDEsMS42MTgsMC4yNDhjMC4wOTUsMC4wMTksMC4xODgsMC4wNDYsMC4yODMsMC4wNjZjMC40NDUsMC4wOTcsMC44ODMsMC4yMTIsMS4zMTYsMC4zMzkgICBjMC4xNjksMC4wNSwwLjMzOCwwLjEsMC41MDUsMC4xNTVjMC40ODgsMC4xNTksMC45NzEsMC4zMzIsMS40NDEsMC41MjljMC4xMjQsMC4wNTIsMC4yNDQsMC4xMTMsMC4zNjcsMC4xNjcgICBjMC4zNzEsMC4xNjUsMC43MzcsMC4zNDEsMS4wOTUsMC41MjhjMC4xNzEsMC4wODksMC4zNDEsMC4xOCwwLjUwOSwwLjI3NWMwLjA4MiwwLjA0NiwwLjE1OSwwLjA5OSwwLjI0MSwwLjE0NiAgIGMtMy4xMTIsMS4xMjYtNC44OTgsMi40NTEtNi45MjQsNS4wODNjLTAuMTIxLDAuMTU4LTAuMjE5LDAuMzMxLTAuMjkxLDAuNTEzYy0wLjEwNy0wLjExMi0wLjIyNy0wLjIxMi0wLjM1OC0wLjI5OCAgIGMtMC43MS0wLjQ2Ni0xLjY0OC0wLjQ1MS0yLjc5MiwwLjA0N0wzMSw5Ljk0NWMtMS4zOTMsMC4xNTUtMi4zOTgsMC4yNjgtMi40NzksMi4wMzJjLTAuMDQsMC44NzIsMC40MjYsMS43MzEsMS4xODcsMi4xODggICBjMC4xNDYsMC4wODgsMC4yOTcsMC4xNTcsMC40NTEsMC4yMDhjMC4wMTksMC4wMzcsMC4wNCwwLjA3NCwwLjA2NCwwLjExMWwwLjIzNCwwLjMzNGMtMC40OTgtMC4xMzUtMC45ODEtMC4yMDUtMS40NTUtMC4yNzQgICBjLTAuNjAyLTAuMDg3LTEuMTY5LTAuMTctMS43MzItMC4zODZjLTIuMTUtMC44MjQtMy43MzctNC40NDMtNC44OTYtNy4wODVjLTAuMjIzLTAuNTA4LTAuNDM1LTAuOTktMC42NDYtMS40OTIgICBDMjEuNzM4LDUuMzg5LDIxLjc0Niw1LjIwNCwyMS43NTIsNS4wMjJ6IE0zNS44NjksMjYuOTE2Yy0xLjg3Ny0xLjU1NC0yLjU4NS0zLjc5Ny0xLjgwNS01LjcxNCAgIGMwLjQwMS0wLjk4My0wLjAwNC0yLjA3Ny0wLjk2NC0yLjY0OWMtMC4wMzctMC4xMzQtMC4wNzEtMC4zOS0wLjA5Ni0wLjU2OGMtMC4wNjgtMC41MTQtMC4xNTEtMS4xMzMtMC40NTQtMS43MjYgICBjMC4xNjQsMC4xMjEsMC4zNSwwLjIxNSwwLjU1MSwwLjI3N2MwLjE4MSwwLjA1NiwwLjIyOSwwLjEwMiwwLjI1NywwLjE4M2MwLjI0OSwwLjg1OCwwLjgyNCwxLjQ5NSwxLjU3NywxLjc0NiAgIGMwLjcyMywwLjIzOSwxLjUyMSwwLjA4OSwyLjE5LTAuNDE2YzAuMTk4LTAuMTQ4LDAuMjMyLTAuMTc2LDAuOTk3LDAuMTkzYzAuNTIzLDAuMjUzLDEuMTc0LDAuNTY4LDIuMDc5LDAuNjY4ICAgYzAuNTMyLDAuNTU5LDAuOTUxLDEuMjcxLDEuMzU1LDEuOTYxYzAuNjI5LDEuMDY5LDEuMjc4LDIuMTc2LDIuMzg5LDIuNzUzYzAuMzY5LDAuMTkxLDAuMTQxLDEuMzc4LTAuNjc5LDMuNTI1ICAgYy0wLjA3NSwwLjE5OC0wLjE0NiwwLjM4NS0wLjIwOCwwLjU1NWMtMS4wMzksMC44MTktMS42NzYsMS43MzEtMi4yOTQsMi42MTVjLTAuNTY2LDAuODEyLTEuMTAyLDEuNTc4LTEuOTU5LDIuMzE1ICAgYy0xLjMyNCwxLjE0LTIuMzkzLDEuNzkyLTMuNzU2LDIuMTlDMzYuNDU5LDMyLjMwNSwzOC4wNzYsMjguNzQzLDM1Ljg2OSwyNi45MTZ6IE0zMS40OTgsMTIuMDc5bC0wLjY4MiwwLjQwMyAgIGMtMC4wMDEsMC0wLjAwMSwwLTAuMDAxLDBjLTAuMDE5LDAtMC4wODQtMC4wMjEtMC4xNTYtMC4wOTNjLTAuMDkyLTAuMDkxLTAuMTQ2LTAuMjE0LTAuMTQxLTAuMzIgICBjMC4wMDEtMC4wMTgsMC4wMDItMC4wMzQsMC4wMDMtMC4wNWMwLjE4NC0wLjAyOSwwLjQ0NC0wLjA1OSwwLjctMC4wODdsMC40NzEtMC4wNTRsMC4xNDctMC4wNjggICBjMC43NS0wLjM0OSwxLjAwMy0wLjI1OCwxLjAwMy0wLjI1OGMwLjAwMiwwLjAwMSwwLjIxMSwwLjIxMSwwLjE4NSwxLjE1MmwtMC4wMDksMC4zMTdjLTAuMTg3LTAuMDcyLTAuNDMxLTAuMTMxLTAuNzUxLTAuMTUyICAgYy0wLjA0My0wLjA3OS0wLjEtMC4xNTgtMC4xNzQtMC4yMzVMMzEuNDk4LDEyLjA3OXogTTMxLjk0OSwxNS40OTljLTAuMTQ5LTAuMTIyLTAuMzA2LTAuMjIxLTAuNDM4LTAuMjg2ICAgYy0wLjE4NS0wLjA5LTAuMzY3LTAuMTY3LTAuNTQ3LTAuMjMybDAuMjktMC4wNDljMC4yLTAuMDMzLDAuMzg0LTAuMDUzLDAuNTQtMC4wNjJDMzEuODExLDE1LjA4NiwzMS44NjIsMTUuMjk5LDMxLjk0OSwxNS40OTl6ICAgIE0xOS44ODUsNi4zNzJjMC4wMTUsMC4wMzgsMC4wMiwwLjA4MSwwLjAzOCwwLjExOGMwLjE5NywwLjQyNSwwLjQwMiwwLjg5NCwwLjYxOSwxLjM4OGMxLjM3MywzLjEzMSwzLjA4MSw3LjAyNiw2LjAxMSw4LjE0OSAgIGMwLjc3MSwwLjI5NiwxLjUxLDAuNDAzLDIuMTYxLDAuNDk4YzAuNzA3LDAuMTAzLDEuMzE4LDAuMTkxLDEuOTEsMC40ODFjMC4wMjcsMC4wMTUsMC4wNzcsMC4wNDksMC4wNzYsMC4wNDUgICBjMC4yMDIsMC4yOTYsMC4yNjQsMC43NTUsMC4zMjIsMS4xOThjMC4wOTQsMC43MDEsMC4yMSwxLjU3NCwxLjAyNCwyLjAwNWMwLjEwNCwwLjA1NSwwLjE4NSwwLjE0NywwLjE2NiwwLjE5MyAgIGMtMS4xMTgsMi43NDMtMC4xODMsNS44ODgsMi4zODEsOC4wMWMwLjQ0LDAuMzY0LDAuODU4LDEuNTUtMS4yODksNS4zOTNjLTAuNDE3LDAuNzQ4LTAuMzI4LDEuNjU0LDAuMjI2LDIuMzEgICBjMC40MDEsMC40NzYsMC45NzMsMC43MzMsMS41NjUsMC43MzNjMC4yMzEsMCwwLjQ2Ni0wLjAzOSwwLjY5NS0wLjEyYzEuNTIyLTAuNTQzLDIuODE1LTEuMzI3LDQuMzItMi42MjIgICBjMS4wNDgtMC45MDEsMS43MS0xLjg1LDIuMjk0LTIuNjg2YzAuNjE4LTAuODg1LDEuMTUyLTEuNjQ5LDIuMDc0LTIuMzI5bDAuMjg1LTAuMjQ1bDAuMDk3LTAuMjg1ICAgYzAuMDczLTAuMjE0LDAuMTctMC40NjcsMC4yNzUtMC43NDNjMC42OTktMS44MzQsMS44NjktNC45MDItMC4yNjktNi4wMTRjLTAuNi0wLjMxMS0xLjA1Ny0xLjA5LTEuNTg2LTEuOTkgICBjLTAuNDQtMC43NTEtMC45NC0xLjYwMi0xLjYzMi0yLjMyOGMtMC4zMDgtMC4zMjItMC43MzQtMC41MjYtMS4yMzYtMC41OTNjLTAuNTM5LTAuMDY5LTAuOTg2LTAuMjg2LTEuNDItMC40OTUgICBjLTAuNzg0LTAuMzgtMS44NTgtMC44OTgtMy4wNywwLjAwOWMtMC4wOCwwLjA2Mi0wLjIzMSwwLjE1Mi0wLjM1NiwwLjExNmMtMC4wOTItMC4wMzEtMC4yMTUtMC4xNTMtMC4yODktMC40MDcgICBjLTAuMjE3LTAuNzQ3LTAuNjg1LTEuMjI2LTEuNDY3LTEuNDk2YzAuMTA4LTAuMzMzLDAuMDktMC42NjgtMC4wNDYtMC45NmwwLjExNSwwLjAxOGMwLjg5OCwwLjEzMiwxLjU3LTAuMDU0LDIuMDA2LTAuNTU1ICAgYzAuNDQ5LTAuNTE1LDAuNTM4LTEuMjUxLDAuMjY1LTIuMTg4Yy0wLjAwNS0wLjAxNiwwLTAuMDYyLDAuMDI2LTAuMDk2YzEuODg5LTIuNDU2LDMuMzktMy41MjIsNi40MjUtNC41NjQgICBjMC4zMDEtMC4xMDMsMC41Ni0wLjI3OSwwLjc3Mi0wLjQ5OGM0LjYxNiwzLjQ2OSw3LjYyLDguOTczLDcuNjIsMTUuMTc4YzAsMTAuNDc3LTguNTIzLDE5LTE5LDE5cy0xOS04LjUyMy0xOS0xOSAgIEMxMi45OTQsMTUuMTIyLDE1LjY3OSw5Ljg1OSwxOS44ODUsNi4zNzJ6IE00MS4wMDYsNTd2MWgtMTh2LTFINDEuMDA2eiBNNDcuNTM1LDM3Ljk1NWMtOS4wMTMsOC4yNzEtMjMuMDczLDguMDM4LTMxLjgwNC0wLjY5MSAgIEMxMS4zOTUsMzIuOTI3LDkuMDA2LDI3LjE1MSw5LjAwNiwyMWMwLTUuODE1LDIuMTM1LTExLjI5Niw2LjAzMy0xNS41NDFsMS40NCwxLjQzOUMxMy4wODQsMTAuNjMsMTAuOTk0LDE1LjU3LDEwLjk5NCwyMSAgIGMwLDExLjU3OSw5LjQyMSwyMSwyMSwyMWM1LjQzLDAsMTAuMzctMi4wOSwxNC4xMDEtNS40ODRMNDcuNTM1LDM3Ljk1NXoiIGZpbGw9IiMwMDZERjAiLz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8L3N2Zz4K" />
+    </div>
+    <div id="mode_location" style="display:none">
+    
+      <img src="data:image/svg+xml;utf8;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pgo8IS0tIEdlbmVyYXRvcjogQWRvYmUgSWxsdXN0cmF0b3IgMTkuMC4wLCBTVkcgRXhwb3J0IFBsdWctSW4gLiBTVkcgVmVyc2lvbjogNi4wMCBCdWlsZCAwKSAgLS0+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmVyc2lvbj0iMS4xIiBpZD0iQ2FwYV8xIiB4PSIwcHgiIHk9IjBweCIgdmlld0JveD0iMCAwIDYxLjE2OCA2MS4xNjgiIHN0eWxlPSJlbmFibGUtYmFja2dyb3VuZDpuZXcgMCAwIDYxLjE2OCA2MS4xNjg7IiB4bWw6c3BhY2U9InByZXNlcnZlIiB3aWR0aD0iMzJweCIgaGVpZ2h0PSIzMnB4Ij4KPGc+Cgk8cGF0aCBkPSJNMzAuOTM4LDI2LjU4NGMzLjg1OSwwLDctMy4xNDEsNy03cy0zLjE0MS03LTctN3MtNywzLjE0MS03LDdTMjcuMDc4LDI2LjU4NCwzMC45MzgsMjYuNTg0eiBNMzAuOTM4LDE0LjU4NCAgIGMyLjc1NywwLDUsMi4yNDMsNSw1cy0yLjI0Myw1LTUsNXMtNS0yLjI0My01LTVTMjguMTgxLDE0LjU4NCwzMC45MzgsMTQuNTg0eiIgZmlsbD0iI0Q4MDAyNyIvPgoJPHBhdGggZD0iTTUwLjIxNiwzNy41ODRoLTcuMTYxbDMuMDQ3LTQuNGM1Ljc1NS03LjY3MSw0LjkyMi0yMC4yOC0xLjc4MS0yNi45ODJjLTMuNjIxLTMuNjIyLTguNDM3LTUuNjE3LTEzLjU2LTUuNjE3ICAgYy01LjEyMiwwLTkuOTM4LDEuOTk1LTEzLjU2LDUuNjE3Yy02LjcwMyw2LjcwMi03LjUzNiwxOS4zMTItMS44MDQsMjYuOTUybDMuMDY4LDQuNDMxaC03LjUxM0wwLDYwLjU4NGg2MS4xNjhMNTAuMjE2LDM3LjU4NHogICAgTTE3LjAyLDMxLjk4NGMtNS4xOTktNi45MzMtNC40NTQtMTguMzIsMS41OTYtMjQuMzY5YzMuMjQ0LTMuMjQ0LDcuNTU4LTUuMDMxLDEyLjE0Ni01LjAzMXM4LjkwMSwxLjc4NywxMi4xNDYsNS4wMzEgICBjNi4wNSw2LjA0OSw2Ljc5NSwxNy40MzcsMS41NzMsMjQuMzk5TDMwLjc2MSw1MS44MjdsLTkuODYzLTE0LjI0M2gwTDE3LjAyLDMxLjk4NHogTTEyLjIxNiwzOS41ODRoNy42MzRsMTAuOTExLDE1Ljc1NyAgIGwxMC45MS0xNS43NTdoNy4yODFsOS4wNDgsMTlIMy4xNjhMMTIuMjE2LDM5LjU4NHoiIGZpbGw9IiNEODAwMjciLz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8L3N2Zz4K" />
+
+    </div>
+    </button>
+    </div>
+    </td></tr>
+    <tr><td><div id="mode_chat" style="display:none"><button class="rounded" id="toggle_chat" onclick="toggleChat()">
+      <img src="data:image/svg+xml;utf8;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pgo8IS0tIEdlbmVyYXRvcjogQWRvYmUgSWxsdXN0cmF0b3IgMTkuMS4wLCBTVkcgRXhwb3J0IFBsdWctSW4gLiBTVkcgVmVyc2lvbjogNi4wMCBCdWlsZCAwKSAgLS0+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmVyc2lvbj0iMS4xIiBpZD0iQ2FwYV8xIiB4PSIwcHgiIHk9IjBweCIgdmlld0JveD0iMCAwIDQ3Ny42IDQ3Ny42IiBzdHlsZT0iZW5hYmxlLWJhY2tncm91bmQ6bmV3IDAgMCA0NzcuNiA0NzcuNjsiIHhtbDpzcGFjZT0icHJlc2VydmUiIHdpZHRoPSIzMnB4IiBoZWlnaHQ9IjMycHgiPgo8Zz4KCTxnPgoJCTxwYXRoIGQ9Ik00MDcuNTgzLDcwYy00NS4xLTQ1LjEtMTA1LTcwLTE2OC44LTcwcy0xMjMuNywyNC45LTE2OC44LDcwYy04Nyw4Ny05My4zLDIyNi0xNS44LDMyMC4yYy0xMC43LDIxLjktMjMuMywzNi41LTM3LjYsNDMuNSAgICBjLTguNyw0LjMtMTMuNiwxMy43LTEyLjIsMjMuM2MxLjUsOS43LDguOSwxNy4yLDE4LjYsMTguN2M1LjMsMC44LDExLDEuMywxNi45LDEuM2wwLDBjMjkuMywwLDYwLjEtMTAuMSw4NS44LTI3LjggICAgYzM0LjYsMTguNiw3My41LDI4LjQsMTEzLjEsMjguNGM2My44LDAsMTIzLjctMjQuOCwxNjguOC02OS45czY5LjktMTA1LjEsNjkuOS0xNjguOFM0NTIuNjgzLDExNS4xLDQwNy41ODMsNzB6IE0zODguNDgzLDM4OC41ICAgIGMtNDAsNDAtOTMuMiw2Mi0xNDkuNyw2MmMtMzcuOCwwLTc0LjktMTAuMS0xMDcuMi0yOS4xYy0yLjEtMS4yLTQuNS0xLjktNi44LTEuOWMtMi45LDAtNS45LDEtOC4zLDIuOCAgICBjLTMwLjYsMjMuNy02MS40LDI3LjItNzQuOSwyNy41YzE2LjEtMTIsMjkuNi0zMC42LDQwLjktNTYuNWMyLjEtNC44LDEuMi0xMC40LTIuMy0xNC40Yy03NC04My42LTcwLjEtMjExLDguOS0yOTAgICAgYzQwLTQwLDkzLjItNjIsMTQ5LjctNjJzMTA5LjcsMjIsMTQ5LjcsNjJDNDcxLjA4MywxNzEuNiw0NzEuMDgzLDMwNiwzODguNDgzLDM4OC41eiIgZmlsbD0iIzkxREM1QSIvPgoJCTxwYXRoIGQ9Ik0zMzguNzgzLDE2MGgtMjAwYy03LjUsMC0xMy41LDYtMTMuNSwxMy41czYsMTMuNSwxMy41LDEzLjVoMjAwYzcuNSwwLDEzLjUtNiwxMy41LTEzLjVTMzQ2LjE4MywxNjAsMzM4Ljc4MywxNjB6IiBmaWxsPSIjOTFEQzVBIi8+CgkJPHBhdGggZD0iTTMzOC43ODMsMjI1LjNoLTIwMGMtNy41LDAtMTMuNSw2LTEzLjUsMTMuNXM2LDEzLjUsMTMuNSwxMy41aDIwMGM3LjUsMCwxMy41LTYsMTMuNS0xMy41UzM0Ni4xODMsMjI1LjMsMzM4Ljc4MywyMjUuM3oiIGZpbGw9IiM5MURDNUEiLz4KCQk8cGF0aCBkPSJNMzM4Ljc4MywyOTAuNmgtMjAwYy03LjUsMC0xMy41LDYtMTMuNSwxMy41czYsMTMuNSwxMy41LDEzLjVoMjAwYzcuNSwwLDEzLjUtNiwxMy41LTEzLjVTMzQ2LjE4MywyOTAuNiwzMzguNzgzLDI5MC42eiIgZmlsbD0iIzkxREM1QSIvPgoJPC9nPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+Cjwvc3ZnPgo=" />
+    </button></div></td></tr>
+  </table>
+</div>
+<div id="panel_top_right">
+  <table><tr>
+  <td>
+    <div id="div_address_select" class="maininput">
+      <input id="address" type="textbox">
+    </div>
+    <div id="div_state_select" class="maininput" style="display:none">
+      <input id="state" type="textbox" value="Описание точки">
+    </div>
+  </td>
+  <td>
+    <div id="div_address_find">
+      <button id="find_address" class="rounded" onclick="codeAddress()">
+        <img src="data:image/svg+xml;utf8;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pgo8IS0tIEdlbmVyYXRvcjogQWRvYmUgSWxsdXN0cmF0b3IgMTkuMC4wLCBTVkcgRXhwb3J0IFBsdWctSW4gLiBTVkcgVmVyc2lvbjogNi4wMCBCdWlsZCAwKSAgLS0+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmVyc2lvbj0iMS4xIiBpZD0iQ2FwYV8xIiB4PSIwcHgiIHk9IjBweCIgdmlld0JveD0iMCAwIDUyLjk2NiA1Mi45NjYiIHN0eWxlPSJlbmFibGUtYmFja2dyb3VuZDpuZXcgMCAwIDUyLjk2NiA1Mi45NjY7IiB4bWw6c3BhY2U9InByZXNlcnZlIiB3aWR0aD0iMTZweCIgaGVpZ2h0PSIxNnB4Ij4KPHBhdGggZD0iTTUxLjcwNCw1MS4yNzNMMzYuODQ1LDM1LjgyYzMuNzktMy44MDEsNi4xMzgtOS4wNDEsNi4xMzgtMTQuODJjMC0xMS41OC05LjQyLTIxLTIxLTIxcy0yMSw5LjQyLTIxLDIxczkuNDIsMjEsMjEsMjEgIGM1LjA4MywwLDkuNzQ4LTEuODE3LDEzLjM4NC00LjgzMmwxNC44OTUsMTUuNDkxYzAuMTk2LDAuMjA1LDAuNDU4LDAuMzA3LDAuNzIxLDAuMzA3YzAuMjUsMCwwLjQ5OS0wLjA5MywwLjY5My0wLjI3OSAgQzUyLjA3NCw1Mi4zMDQsNTIuMDg2LDUxLjY3MSw1MS43MDQsNTEuMjczeiBNMjEuOTgzLDQwYy0xMC40NzcsMC0xOS04LjUyMy0xOS0xOXM4LjUyMy0xOSwxOS0xOXMxOSw4LjUyMywxOSwxOSAgUzMyLjQ1OSw0MCwyMS45ODMsNDB6IiBmaWxsPSIjMDA2REYwIi8+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+Cjwvc3ZnPgo=" />
+      </button>
+    </div>
+    <div id="div_state_ttl" class="mainselection" style="display:none">
+      <select id="ttl_select" onchange="customOptionSelect()">
+        <option value="0">Другое</option>
+        <option value="1" selected>1 мин</option>
+        <option value="5">5 мин</option>
+        <option value="10">10 мин</option>
+        <option value="30">30 мин</option>
+        <option value="60">1 час</option>
+        <option value="120">2 часа</option>
+      </select>
+    </div>
+  </td>
+  </tr></table>
+</div>
+<div id="panel_center_right">
+  <table>
+  <tr><td><button class="rounded" id="center_btn" onclick="centerLocation()">
+    <img src="data:image/svg+xml;utf8;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pgo8IS0tIEdlbmVyYXRvcjogQWRvYmUgSWxsdXN0cmF0b3IgMTYuMC4wLCBTVkcgRXhwb3J0IFBsdWctSW4gLiBTVkcgVmVyc2lvbjogNi4wMCBCdWlsZCAwKSAgLS0+CjwhRE9DVFlQRSBzdmcgUFVCTElDICItLy9XM0MvL0RURCBTVkcgMS4xLy9FTiIgImh0dHA6Ly93d3cudzMub3JnL0dyYXBoaWNzL1NWRy8xLjEvRFREL3N2ZzExLmR0ZCI+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmVyc2lvbj0iMS4xIiBpZD0iQ2FwYV8xIiB4PSIwcHgiIHk9IjBweCIgd2lkdGg9IjE2cHgiIGhlaWdodD0iMTZweCIgdmlld0JveD0iMCAwIDMyLjY2OCAzMi42NjgiIHN0eWxlPSJlbmFibGUtYmFja2dyb3VuZDpuZXcgMCAwIDMyLjY2OCAzMi42Njg7IiB4bWw6c3BhY2U9InByZXNlcnZlIj4KPGc+Cgk8cGF0aCBkPSJNMzIuNjY4LDE0LjMzNWgtNC4wMTFjLTAuODU0LTUuMjktNS4wMzMtOS40NjgtMTAuMzIyLTEwLjMyNHYtNC4wMWgtNFY0LjAxQzkuMDQ1LDQuODY2LDQuODY2LDkuMDQ0LDQuMDEsMTQuMzMzSDB2NCAgIGg0LjAwOWMwLjg1NSw1LjI5MSw1LjAzNSw5LjQ3MywxMC4zMjYsMTAuMzI3djQuMDA3aDR2LTQuMDA4YzUuMjg5LTAuODU2LDkuNDY4LTUuMDM0LDEwLjMyMi0xMC4zMjRoNC4wMTFWMTQuMzM1TDMyLjY2OCwxNC4zMzV6ICAgIE0xOC4zMzUsMjYuNjR2LTMuNjM5aC00djMuNjM5Yy00LjE4OC0wLjgxMi03LjQ5NC00LjExNS04LjMwNS04LjMwN2gzLjYzNnYtNEg2LjAzYzAuODEyLTQuMTg4LDQuMTE3LTcuNDkxLDguMzA1LTguMzAydjMuNjM2aDQgICBWNi4wMzFjNC4xODgsMC44MTIsNy40OSw0LjExNSw4LjMwNCw4LjMwNGgtMy42Mzh2NGgzLjYzOEMyNS44MjUsMjIuNTIyLDIyLjUyMSwyNS44MjcsMTguMzM1LDI2LjY0eiIgZmlsbD0iIzAwNkRGMCIvPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+Cjwvc3ZnPgo=" />
+  </button></td></tr>
+  <tr><td><button class="rounded" id="zoom_plus" onclick="changeZoom('+')">
+    <img src="data:image/svg+xml;utf8;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pgo8IS0tIEdlbmVyYXRvcjogQWRvYmUgSWxsdXN0cmF0b3IgMTkuMC4wLCBTVkcgRXhwb3J0IFBsdWctSW4gLiBTVkcgVmVyc2lvbjogNi4wMCBCdWlsZCAwKSAgLS0+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmVyc2lvbj0iMS4xIiBpZD0iQ2FwYV8xIiB4PSIwcHgiIHk9IjBweCIgdmlld0JveD0iMCAwIDUyIDUyIiBzdHlsZT0iZW5hYmxlLWJhY2tncm91bmQ6bmV3IDAgMCA1MiA1MjsiIHhtbDpzcGFjZT0icHJlc2VydmUiIHdpZHRoPSIxNnB4IiBoZWlnaHQ9IjE2cHgiPgo8Zz4KCTxwYXRoIGQ9Ik0yNiwwQzExLjY2NCwwLDAsMTEuNjYzLDAsMjZzMTEuNjY0LDI2LDI2LDI2czI2LTExLjY2MywyNi0yNlM0MC4zMzYsMCwyNiwweiBNMjYsNTBDMTIuNzY3LDUwLDIsMzkuMjMzLDIsMjYgICBTMTIuNzY3LDIsMjYsMnMyNCwxMC43NjcsMjQsMjRTMzkuMjMzLDUwLDI2LDUweiIgZmlsbD0iIzAwNkRGMCIvPgoJPHBhdGggZD0iTTM4LjUsMjVIMjdWMTRjMC0wLjU1My0wLjQ0OC0xLTEtMXMtMSwwLjQ0Ny0xLDF2MTFIMTMuNWMtMC41NTIsMC0xLDAuNDQ3LTEsMXMwLjQ0OCwxLDEsMUgyNXYxMmMwLDAuNTUzLDAuNDQ4LDEsMSwxICAgczEtMC40NDcsMS0xVjI3aDExLjVjMC41NTIsMCwxLTAuNDQ3LDEtMVMzOS4wNTIsMjUsMzguNSwyNXoiIGZpbGw9IiMwMDZERjAiLz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8Zz4KPC9nPgo8L3N2Zz4K" />
+  </button></td></tr>
+  <tr><td><button class="rounded" id="zoom_minus" onclick="changeZoom('-')">
+    <img src="data:image/svg+xml;utf8;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pgo8IS0tIEdlbmVyYXRvcjogQWRvYmUgSWxsdXN0cmF0b3IgMTkuMC4wLCBTVkcgRXhwb3J0IFBsdWctSW4gLiBTVkcgVmVyc2lvbjogNi4wMCBCdWlsZCAwKSAgLS0+CjxzdmcgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB4bWxuczp4bGluaz0iaHR0cDovL3d3dy53My5vcmcvMTk5OS94bGluayIgdmVyc2lvbj0iMS4xIiBpZD0iQ2FwYV8xIiB4PSIwcHgiIHk9IjBweCIgdmlld0JveD0iMCAwIDUyIDUyIiBzdHlsZT0iZW5hYmxlLWJhY2tncm91bmQ6bmV3IDAgMCA1MiA1MjsiIHhtbDpzcGFjZT0icHJlc2VydmUiIHdpZHRoPSIxNnB4IiBoZWlnaHQ9IjE2cHgiPgo8Zz4KCTxwYXRoIGQ9Ik0yNiwwQzExLjY2NCwwLDAsMTEuNjYzLDAsMjZzMTEuNjY0LDI2LDI2LDI2czI2LTExLjY2MywyNi0yNlM0MC4zMzYsMCwyNiwweiBNMjYsNTBDMTIuNzY3LDUwLDIsMzkuMjMzLDIsMjYgICBTMTIuNzY3LDIsMjYsMnMyNCwxMC43NjcsMjQsMjRTMzkuMjMzLDUwLDI2LDUweiIgZmlsbD0iIzAwNkRGMCIvPgoJPHBhdGggZD0iTTM5LDI1SDEzYy0wLjU1MiwwLTEsMC40NDctMSwxczAuNDQ4LDEsMSwxaDI2YzAuNTUyLDAsMS0wLjQ0NywxLTFTMzkuNTUyLDI1LDM5LDI1eiIgZmlsbD0iIzAwNkRGMCIvPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+CjxnPgo8L2c+Cjwvc3ZnPgo=" />
+  </button></td></tr>
+  </table>
+</div>
+<div id="map"></div>
+<script async defer
+    src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAwYsZytNzWTAiiXWQIoBnfMNGkaMvIrgw&libraries=geometry,visualization&callback=initMap">
+</script>
+</body>
+</html>
