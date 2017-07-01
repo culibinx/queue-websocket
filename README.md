@@ -172,6 +172,14 @@ d3.queue(1) /* queue serial */
 </script>
 ```
 
+### Example usage Redis + Disque + WebSocket + Gooogle Maps
+
+In the upper left corner, click the map icon to change the mode. Enter a description of the point, the time of the point in minutes and double-click on the map place the marker. This example is in the examples folder.
+
+https://idev.su/heatmap/heatmap.html
+
+![Redis + Disque + WebSocket + Gooogle Maps](examples/heatmap.png)
+
 ### Conclusion
 
 I hope these ideas and achievements will be useful. If you have suggestions, comments, or you know how to do best - write.
