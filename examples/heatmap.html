@@ -592,6 +592,15 @@ function initAuthentication(onSuccess) {
       displayName = null;
       state_restart = 0;
       console.log('Login Failed!',sess.error);
+      state_restart--;
+      if (state_restart) {
+        setTimeout(function () { 
+            initAuthentication(onSuccess);
+        }, 1000);
+      } else {
+        alert('Login Failed!');
+      }
+      
     }
   });
 }
